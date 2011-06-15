@@ -1,3 +1,9 @@
+nginx (0.7.67-4sg1) UNRELEASED; urgency=low
+
+  * UNRELEASED
+
+ -- SimpleGeo Nerds <nerds@simplegeo.com>  Wed, 15 Jun 2011 19:14:07 +0000
+
 nginx (0.7.67-4sg0) lucid; urgency=low
 
   * Return JSON error responses

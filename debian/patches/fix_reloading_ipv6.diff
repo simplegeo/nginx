@@ -1,0 +1,15 @@
+Description: Patch to fix reloading IPv6 addresses
+Debian Bug: http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=577456
+Author: Matthias-Christian Ott <ott@mirix.org>
+
+--- nginx-0.7.65.orig/src/core/ngx_cycle.c	2010-04-13 10:07:14.000000000 +0530
++++ nginx-0.7.65/src/core/ngx_cycle.c	2010-04-13 10:09:59.000000000 +0530
+@@ -847,7 +847,7 @@
+         sin61 = (struct sockaddr_in6 *) sa1;
+         sin62 = (struct sockaddr_in6 *) sa2;
+ 
+-        if (sin61->sin6_port != sin61->sin6_port) {
++        if (sin61->sin6_port != sin62->sin6_port) {
+             return NGX_DECLINED;
+         }
+ 

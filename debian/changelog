@@ -1,3 +1,9 @@
+nginx (0.7.67-4sg0) lucid; urgency=low
+
+  * Return JSON error responses
+
+ -- Jeremy Grosser <jeremy@synack.me>  Wed, 15 Jun 2011 19:08:22 +0000
+
 nginx (0.7.67-3ubuntu1) maverick; urgency=low
 
   * Merge from debian testing. (LP: #616685) Remaining changes:

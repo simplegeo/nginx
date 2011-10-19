@@ -1,3 +1,12 @@
+nginx (0.7.67-4sg2) UNRELEASED; urgency=low
+
+  [ Jeremy Grosser ]
+  * Add ngx_http_upstream_keepalive module.
+
+  [ SimpleGeo Nerds ]
+
+ -- SimpleGeo Nerds <nerds@simplegeo.com>  Wed, 19 Oct 2011 17:55:47 +0000
+
 nginx (0.7.67-4sg1) UNRELEASED; urgency=low
 
   * UNRELEASED

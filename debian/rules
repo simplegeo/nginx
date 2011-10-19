@@ -42,6 +42,7 @@ endif
 	    --with-mail \
 	    --with-mail_ssl_module \
 	    --add-module=$(CURDIR)/modules/nginx-upstream-fair \
+		--add-module=$(CURDIR)/modules/ngx_http_upstream_keepalive \
             $(CONFIGURE_OPTS)
 
 build: config.status

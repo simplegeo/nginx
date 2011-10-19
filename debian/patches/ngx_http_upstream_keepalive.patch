@@ -1,0 +1,1654 @@
+diff --git a/modules/ngx_http_upstream_keepalive/CHANGES b/modules/ngx_http_upstream_keepalive/CHANGES
+new file mode 100644
+index 0000000..00a1219
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/CHANGES
+@@ -0,0 +1,45 @@
++
++Changes with upstream keepalive module 0.7 (2011-09-08):
++
++    *) Bugfix: unbuffered connection might not be kept alive under Linux.
++
++
++Changes with upstream keepalive module 0.6 (2011-09-04):
++
++    *) Bugfix: module could not be built on Windows.
++
++    *) Bugfix: module could not be built without the ngx_http_ssl_module.
++
++
++Changes with upstream keepalive module 0.5 (2011-09-03):
++
++    *) Feature: https connections support (requires patches).
++
++    *) Bugfix: invalid connections might be cached.
++
++
++Changes with upstream keepalive module 0.4 (2010-12-15):
++
++    *) Bugfix: the "[alert] ... open socket ... left in connection ..."
++       messages were logged on nginx worker process gracefull exit for
++       each cached connection; the bug had appeared in 0.3.
++
++
++Changes with upstream keepalive module 0.3 (2010-09-14):
++
++    *) Bugfix: cached connections might be closed needlessly.
++       Thanks to Martin Fjordvald.
++
++    *) Bugfix: in memory allocation error handling on config creation.
++
++
++Changes with upstream keepalive module 0.2 (2009-05-15):
++
++    *) Feature: expiremental support for FastCGI (requires patches).
++
++    *) Bugfix: invalid connections might be cached.
++
++
++Changes with upstream keepalive module 0.1 (2008-10-24):
++
++    *) The first public version.
+diff --git a/modules/ngx_http_upstream_keepalive/LICENSE b/modules/ngx_http_upstream_keepalive/LICENSE
+new file mode 100644
+index 0000000..2b71e91
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/LICENSE
+@@ -0,0 +1,24 @@
++/* 
++ * Copyright (C) 2008-2011 Maxim Dounin
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
+diff --git a/modules/ngx_http_upstream_keepalive/README b/modules/ngx_http_upstream_keepalive/README
+new file mode 100644
+index 0000000..f44cc35
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/README
+@@ -0,0 +1,46 @@
++Keepalive balancer module for nginx.
++
++This module implements cache for backend connections.  As of now, it may
++be used with memcached upstreams.  Support for fastcgi, http and https
++requires expiremental patches for nginx.
++
++Configuration directives:
++
++    keepalive <num> [single]
++
++        Scope: upstream
++
++        Switches on keepalive module for the upstream in question.
++
++        Parameters:
++
++            - <num>
++              Maximum number of connections to cache.  If there isn't enough
++              room to cache new connections - last recently used connections
++              will be kicked off the cache.
++
++            - single
++              Treat everything as single host.  With this flag connections
++              to different backends are treated as equal.
++
++Sample configuration:
++
++    upstream memd {
++        server 127.0.0.1:11211;
++        server 10.0.0.2:11211;
++        keepalive 10;
++    }
++
++This module was tested to work with standard round-robin balancing, but
++it's believed to be compatible with more sophisticated balancers.  The only
++requirement is to activate them *before* this module, e.g.:
++
++    upstream memd {
++        server 127.0.0.1:11211;
++        server 10.0.0.2:11211;
++        ip_hash;
++        keepalive 10;
++    }
++
++To compile nginx with keepalive module, use "--add-module <path>" option to
++nginx configure.
+diff --git a/modules/ngx_http_upstream_keepalive/config b/modules/ngx_http_upstream_keepalive/config
+new file mode 100644
+index 0000000..19579df
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/config
+@@ -0,0 +1,7 @@
++ngx_addon_name="ngx_http_upstream_keepalive_module"
++
++HTTP_MODULES="$HTTP_MODULES \
++	ngx_http_upstream_keepalive_module"
++
++NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
++	$ngx_addon_dir/ngx_http_upstream_keepalive_module.c"
+diff --git a/modules/ngx_http_upstream_keepalive/ngx_http_upstream_keepalive_module.c b/modules/ngx_http_upstream_keepalive/ngx_http_upstream_keepalive_module.c
+new file mode 100644
+index 0000000..06a65b6
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/ngx_http_upstream_keepalive_module.c
+@@ -0,0 +1,617 @@
++
++/*
++ * Copyright (C) Maxim Dounin
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_http.h>
++
++
++typedef struct {
++    ngx_uint_t                         max_cached;
++    ngx_uint_t                         single;       /* unsigned:1 */
++
++    ngx_queue_t                        cache;
++    ngx_queue_t                        free;
++
++    ngx_http_upstream_init_pt          original_init_upstream;
++    ngx_http_upstream_init_peer_pt     original_init_peer;
++
++} ngx_http_upstream_keepalive_srv_conf_t;
++
++
++typedef struct {
++    ngx_http_upstream_keepalive_srv_conf_t  *conf;
++
++    ngx_http_upstream_t               *upstream;
++
++    void                              *data;
++
++    ngx_event_get_peer_pt              original_get_peer;
++    ngx_event_free_peer_pt             original_free_peer;
++
++#if (NGX_HTTP_SSL)
++    ngx_event_set_peer_session_pt      original_set_session;
++    ngx_event_save_peer_session_pt     original_save_session;
++#endif
++
++    ngx_uint_t                         failed;       /* unsigned:1 */
++
++} ngx_http_upstream_keepalive_peer_data_t;
++
++
++typedef struct {
++    ngx_http_upstream_keepalive_srv_conf_t  *conf;
++
++    ngx_queue_t                        queue;
++    ngx_connection_t                  *connection;
++
++    socklen_t                          socklen;
++    struct sockaddr_storage            sockaddr;
++
++} ngx_http_upstream_keepalive_cache_t;
++
++
++static ngx_int_t ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
++    ngx_http_upstream_srv_conf_t *us);
++static ngx_int_t ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc,
++    void *data);
++static void ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc,
++    void *data, ngx_uint_t state);
++
++static void ngx_http_upstream_keepalive_dummy_handler(ngx_event_t *ev);
++static void ngx_http_upstream_keepalive_close_handler(ngx_event_t *ev);
++static void ngx_http_upstream_keepalive_close(ngx_connection_t *c);
++
++
++#if (NGX_HTTP_SSL)
++static ngx_int_t ngx_http_upstream_keepalive_set_session(
++    ngx_peer_connection_t *pc, void *data);
++static void ngx_http_upstream_keepalive_save_session(ngx_peer_connection_t *pc,
++    void *data);
++#endif
++
++static void *ngx_http_upstream_keepalive_create_conf(ngx_conf_t *cf);
++static char *ngx_http_upstream_keepalive(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++
++
++static ngx_command_t  ngx_http_upstream_keepalive_commands[] = {
++
++    { ngx_string("keepalive"),
++      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE12,
++      ngx_http_upstream_keepalive,
++      0,
++      0,
++      NULL },
++
++      ngx_null_command
++};
++
++
++static ngx_http_module_t  ngx_http_upstream_keepalive_module_ctx = {
++    NULL,                                  /* preconfiguration */
++    NULL,                                  /* postconfiguration */
++
++    NULL,                                  /* create main configuration */
++    NULL,                                  /* init main configuration */
++
++    ngx_http_upstream_keepalive_create_conf, /* create server configuration */
++    NULL,                                  /* merge server configuration */
++
++    NULL,                                  /* create location configuration */
++    NULL                                   /* merge location configuration */
++};
++
++
++ngx_module_t  ngx_http_upstream_keepalive_module = {
++    NGX_MODULE_V1,
++    &ngx_http_upstream_keepalive_module_ctx, /* module context */
++    ngx_http_upstream_keepalive_commands,    /* module directives */
++    NGX_HTTP_MODULE,                       /* module type */
++    NULL,                                  /* init master */
++    NULL,                                  /* init module */
++    NULL,                                  /* init process */
++    NULL,                                  /* init thread */
++    NULL,                                  /* exit thread */
++    NULL,                                  /* exit process */
++    NULL,                                  /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
++static ngx_int_t
++ngx_http_upstream_init_keepalive(ngx_conf_t *cf,
++    ngx_http_upstream_srv_conf_t *us)
++{
++    ngx_uint_t                               i;
++    ngx_http_upstream_keepalive_srv_conf_t  *kcf;
++    ngx_http_upstream_keepalive_cache_t     *cached;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0,
++                   "init keepalive");
++
++    kcf = ngx_http_conf_upstream_srv_conf(us,
++                                          ngx_http_upstream_keepalive_module);
++
++    if (kcf->original_init_upstream(cf, us) != NGX_OK) {
++        return NGX_ERROR;
++    }
++
++    kcf->original_init_peer = us->peer.init;
++
++    us->peer.init = ngx_http_upstream_init_keepalive_peer;
++
++    /* allocate cache items and add to free queue */
++
++    cached = ngx_pcalloc(cf->pool,
++                sizeof(ngx_http_upstream_keepalive_cache_t) * kcf->max_cached);
++    if (cached == NULL) {
++        return NGX_ERROR;
++    }
++
++    ngx_queue_init(&kcf->cache);
++    ngx_queue_init(&kcf->free);
++
++    for (i = 0; i < kcf->max_cached; i++) {
++        ngx_queue_insert_head(&kcf->free, &cached[i].queue);
++        cached[i].conf = kcf;
++    }
++
++    return NGX_OK;
++}
++
++
++static ngx_int_t
++ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
++    ngx_http_upstream_srv_conf_t *us)
++{
++    ngx_http_upstream_keepalive_peer_data_t  *kp;
++    ngx_http_upstream_keepalive_srv_conf_t   *kcf;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                   "init keepalive peer");
++
++    kcf = ngx_http_conf_upstream_srv_conf(us,
++                                          ngx_http_upstream_keepalive_module);
++
++    kp = ngx_palloc(r->pool, sizeof(ngx_http_upstream_keepalive_peer_data_t));
++    if (kp == NULL) {
++        return NGX_ERROR;
++    }
++
++    if (kcf->original_init_peer(r, us) != NGX_OK) {
++        return NGX_ERROR;
++    }
++
++    kp->conf = kcf;
++    kp->upstream = r->upstream;
++    kp->data = r->upstream->peer.data;
++    kp->original_get_peer = r->upstream->peer.get;
++    kp->original_free_peer = r->upstream->peer.free;
++
++    r->upstream->peer.data = kp;
++    r->upstream->peer.get = ngx_http_upstream_get_keepalive_peer;
++    r->upstream->peer.free = ngx_http_upstream_free_keepalive_peer;
++
++#if (NGX_HTTP_SSL)
++    kp->original_set_session = r->upstream->peer.set_session;
++    kp->original_save_session = r->upstream->peer.save_session;
++    r->upstream->peer.set_session = ngx_http_upstream_keepalive_set_session;
++    r->upstream->peer.save_session = ngx_http_upstream_keepalive_save_session;
++#endif
++
++    return NGX_OK;
++}
++
++
++static ngx_int_t
++ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
++{
++    ngx_http_upstream_keepalive_peer_data_t  *kp = data;
++    ngx_http_upstream_keepalive_cache_t      *item;
++
++    ngx_int_t          rc;
++    ngx_queue_t       *q, *cache;
++    ngx_connection_t  *c;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0,
++                   "get keepalive peer");
++
++    kp->failed = 0;
++
++    /* single pool of cached connections */
++
++    if (kp->conf->single && !ngx_queue_empty(&kp->conf->cache)) {
++
++        q = ngx_queue_head(&kp->conf->cache);
++
++        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
++        c = item->connection;
++
++        ngx_queue_remove(q);
++        ngx_queue_insert_head(&kp->conf->free, q);
++
++        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
++                       "get keepalive peer: using connection %p", c);
++
++        c->idle = 0;
++        c->log = pc->log;
++        c->read->log = pc->log;
++        c->write->log = pc->log;
++#if (NGX_UPSTREAM_KEEPALIVE_PATCHED)
++        c->pool->log = pc->log;
++#endif
++
++        pc->connection = c;
++        pc->cached = 1;
++
++        return NGX_DONE;
++    }
++
++    rc = kp->original_get_peer(pc, kp->data);
++
++    if (kp->conf->single || rc != NGX_OK) {
++        return rc;
++    }
++
++    /* search cache for suitable connection */
++
++    cache = &kp->conf->cache;
++
++    for (q = ngx_queue_head(cache);
++         q != ngx_queue_sentinel(cache);
++         q = ngx_queue_next(q))
++    {
++        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
++        c = item->connection;
++
++        if (ngx_memn2cmp((u_char *) &item->sockaddr, (u_char *) pc->sockaddr,
++                         item->socklen, pc->socklen)
++            == 0)
++        {
++            ngx_queue_remove(q);
++            ngx_queue_insert_head(&kp->conf->free, q);
++
++            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
++                           "get keepalive peer: using connection %p", c);
++
++            c->idle = 0;
++            c->log = pc->log;
++            c->read->log = pc->log;
++            c->write->log = pc->log;
++#if (NGX_UPSTREAM_KEEPALIVE_PATCHED)
++            c->pool->log = pc->log;
++#endif
++
++            pc->connection = c;
++            pc->cached = 1;
++
++            return NGX_DONE;
++        }
++    }
++
++    return NGX_OK;
++}
++
++
++static void
++ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
++    ngx_uint_t state)
++{
++    ngx_http_upstream_keepalive_peer_data_t  *kp = data;
++    ngx_http_upstream_keepalive_cache_t      *item;
++
++#if !(NGX_UPSTREAM_KEEPALIVE_PATCHED)
++    ngx_uint_t            status;
++#endif
++    ngx_queue_t          *q;
++    ngx_connection_t     *c;
++    ngx_http_upstream_t  *u;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0,
++                   "free keepalive peer");
++
++    /* remember failed state - peer.free() may be called more than once */
++
++    if (state & NGX_PEER_FAILED) {
++        kp->failed = 1;
++    }
++
++    /*
++     * cache valid connections
++     *
++     * For memcached this means status either 404 or 200.  For status 200 we
++     * should also check if all response body was read (u->length == 0) and
++     * make sure that u->length is valid (we use u->header_sent flag to test
++     * this).  Memcached is the only supported protocol for now.
++     *
++     * With experimental patches we are able to cache other connections as
++     * well.  Connection status is signalled via u->keepalive flag.
++     */
++
++    u = kp->upstream;
++    c = pc->connection;
++
++    if (kp->failed
++        || c == NULL
++        || c->read->eof
++        || c->read->error
++        || c->read->timedout
++        || c->write->error
++        || c->write->timedout)
++    {
++        goto invalid;
++    }
++
++#if (NGX_UPSTREAM_KEEPALIVE_PATCHED)
++
++    if (!u->keepalive) {
++        goto invalid;
++    }
++
++#else
++
++    status = u->headers_in.status_n;
++
++    if (!(status == NGX_HTTP_NOT_FOUND
++          || (status == NGX_HTTP_OK && u->header_sent && u->length == 0)))
++    {
++        goto invalid;
++    }
++
++#if (NGX_HTTP_SSL)
++
++    /*
++     * to cache ssl connections separate pool for peer connection is
++     * required, which is only available with patches
++     */
++
++    if (c->ssl) {
++        goto invalid;
++    }
++
++#endif
++
++#endif
++
++    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
++        goto invalid;
++    }
++
++    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
++                   "free keepalive peer: saving connection %p", c);
++
++    if (ngx_queue_empty(&kp->conf->free)) {
++
++        q = ngx_queue_last(&kp->conf->cache);
++        ngx_queue_remove(q);
++
++        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
++
++        ngx_http_upstream_keepalive_close(item->connection);
++
++    } else {
++        q = ngx_queue_head(&kp->conf->free);
++        ngx_queue_remove(q);
++
++        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
++    }
++
++    item->connection = c;
++    ngx_queue_insert_head(&kp->conf->cache, q);
++
++    pc->connection = NULL;
++
++    if (c->read->timer_set) {
++        ngx_del_timer(c->read);
++    }
++    if (c->write->timer_set) {
++        ngx_del_timer(c->write);
++    }
++
++    c->write->handler = ngx_http_upstream_keepalive_dummy_handler;
++    c->read->handler = ngx_http_upstream_keepalive_close_handler;
++
++    c->data = item;
++    c->idle = 1;
++    c->log = ngx_cycle->log;
++    c->read->log = ngx_cycle->log;
++    c->write->log = ngx_cycle->log;
++#if (NGX_UPSTREAM_KEEPALIVE_PATCHED)
++    c->pool->log = ngx_cycle->log;
++#endif
++
++    item->socklen = pc->socklen;
++    ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
++
++    if (c->read->ready) {
++        ngx_http_upstream_keepalive_close_handler(c->read);
++    }
++
++invalid:
++
++    kp->original_free_peer(pc, kp->data, state);
++}
++
++
++static void
++ngx_http_upstream_keepalive_dummy_handler(ngx_event_t *ev)
++{
++    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0,
++                   "keepalive dummy handler");
++}
++
++
++static void
++ngx_http_upstream_keepalive_close_handler(ngx_event_t *ev)
++{
++    ngx_http_upstream_keepalive_srv_conf_t  *conf;
++    ngx_http_upstream_keepalive_cache_t     *item;
++
++    int                n;
++    char               buf[1];
++    ngx_connection_t  *c;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0,
++                   "keepalive close handler");
++
++    c = ev->data;
++
++    if (c->close) {
++        goto close;
++    }
++
++    n = recv(c->fd, buf, 1, MSG_PEEK);
++
++    if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
++        /* stale event */
++
++        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
++            goto close;
++        }
++
++        return;
++    }
++
++close:
++
++    item = c->data;
++    conf = item->conf;
++
++    ngx_http_upstream_keepalive_close(c);
++
++    ngx_queue_remove(&item->queue);
++    ngx_queue_insert_head(&conf->free, &item->queue);
++}
++
++
++static void
++ngx_http_upstream_keepalive_close(ngx_connection_t *c)
++{
++
++#if (NGX_HTTP_SSL)
++
++    if (c->ssl) {
++        c->ssl->no_wait_shutdown = 1;
++        c->ssl->no_send_shutdown = 1;
++
++        if (ngx_ssl_shutdown(c) == NGX_AGAIN) {
++            c->ssl->handler = ngx_http_upstream_keepalive_close;
++            return;
++        }
++    }
++
++#endif
++
++#if (NGX_UPSTREAM_KEEPALIVE_PATCHED)
++    ngx_destroy_pool(c->pool);
++#endif
++    ngx_close_connection(c);
++}
++
++
++#if (NGX_HTTP_SSL)
++
++static ngx_int_t
++ngx_http_upstream_keepalive_set_session(ngx_peer_connection_t *pc, void *data)
++{
++    ngx_http_upstream_keepalive_peer_data_t  *kp = data;
++
++    return kp->original_set_session(pc, kp->data);
++}
++
++
++static void
++ngx_http_upstream_keepalive_save_session(ngx_peer_connection_t *pc, void *data)
++{
++    ngx_http_upstream_keepalive_peer_data_t  *kp = data;
++
++    kp->original_save_session(pc, kp->data);
++    return;
++}
++
++#endif
++
++
++static void *
++ngx_http_upstream_keepalive_create_conf(ngx_conf_t *cf)
++{
++    ngx_http_upstream_keepalive_srv_conf_t  *conf;
++
++    conf = ngx_pcalloc(cf->pool,
++                       sizeof(ngx_http_upstream_keepalive_srv_conf_t));
++    if (conf == NULL) {
++        return NULL;
++    }
++
++    /*
++     * set by ngx_pcalloc():
++     *
++     *     conf->original_init_upstream = NULL;
++     *     conf->original_init_peer = NULL;
++     */
++
++    conf->max_cached = 1;
++
++    return conf;
++}
++
++
++static char *
++ngx_http_upstream_keepalive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    ngx_http_upstream_srv_conf_t            *uscf;
++    ngx_http_upstream_keepalive_srv_conf_t  *kcf;
++
++    ngx_int_t    n;
++    ngx_str_t   *value;
++    ngx_uint_t   i;
++
++    uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
++
++    kcf = ngx_http_conf_upstream_srv_conf(uscf,
++                                          ngx_http_upstream_keepalive_module);
++
++    kcf->original_init_upstream = uscf->peer.init_upstream
++                                  ? uscf->peer.init_upstream
++                                  : ngx_http_upstream_init_round_robin;
++
++    uscf->peer.init_upstream = ngx_http_upstream_init_keepalive;
++
++    /* read options */
++
++    value = cf->args->elts;
++
++    n = ngx_atoi(value[1].data, value[1].len);
++
++    if (n == NGX_ERROR || n == 0) {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                           "invalid value \"%V\" in \"%V\" directive",
++                           &value[1], &cmd->name);
++        return NGX_CONF_ERROR;
++    }
++
++    kcf->max_cached = n;
++
++    for (i = 2; i < cf->args->nelts; i++) {
++
++        if (ngx_strcmp(value[i].data, "single") == 0) {
++            kcf->single = 1;
++            continue;
++        }
++
++        goto invalid;
++    }
++
++    return NGX_CONF_OK;
++
++invalid:
++
++    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                       "invalid parameter \"%V\"", &value[i]);
++
++    return NGX_CONF_ERROR;
++}
+diff --git a/modules/ngx_http_upstream_keepalive/t/fastcgi-keepalive.t b/modules/ngx_http_upstream_keepalive/t/fastcgi-keepalive.t
+new file mode 100644
+index 0000000..121f7f5
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/t/fastcgi-keepalive.t
+@@ -0,0 +1,181 @@
++#!/usr/bin/perl
++
++# (C) Maxim Dounin
++
++# Test for fastcgi backend with keepalive.
++
++###############################################################################
++
++use warnings;
++use strict;
++
++use Test::More;
++use Test::Nginx;
++
++###############################################################################
++
++select STDERR; $| = 1;
++select STDOUT; $| = 1;
++
++my $t = Test::Nginx->new()->write_file_expand('nginx.conf', <<'EOF');
++
++%%TEST_GLOBALS%%
++
++master_process off;
++daemon         off;
++
++events {
++}
++
++http {
++    %%TEST_GLOBALS_HTTP%%
++
++    upstream backend {
++        server 127.0.0.1:8081;
++        keepalive 1;
++    }
++
++    server {
++        listen       127.0.0.1:8080;
++        server_name  localhost;
++
++        location / {
++            fastcgi_pass backend;
++            fastcgi_keep_conn on;
++        }
++    }
++}
++
++EOF
++
++$t->run_daemon(\&fastcgi_test_daemon);
++
++eval {
++	open OLDERR, ">&", \*STDERR; close STDERR;
++	$t->run();
++	open STDERR, ">&", \*OLDERR;
++};
++plan(skip_all => 'no keepalive patches') if $@;
++
++$t->plan(6);
++
++###############################################################################
++
++like(http_get('/'), qr/SEE-THIS/, 'fastcgi request');
++like(http_get('/redir'), qr/302/, 'fastcgi redirect');
++like(http_get('/'), qr/^request: 3$/m, 'fastcgi third request');
++
++like(http_get('/single'), qr/^connection: 1$/m, 'single connection used');
++
++# New connection to fastcgi application should be established after HEAD
++# requests since nginx doesn't read whole response (as it doesn't need
++# body).
++
++unlike(http_head('/head'), qr/SEE-THIS/, 'no data in HEAD');
++
++like(http_get('/after'), qr/^connection: 2$/m, 'new connection after HEAD');
++
++###############################################################################
++
++# Simple FastCGI responder implementation.  Unlike FCGI and FCGI::Async it's
++# able to count connections.
++
++# http://www.fastcgi.com/devkit/doc/fcgi-spec.html
++
++sub fastcgi_read_record($) {
++	my ($socket) = @_;
++
++	my ($n, $h, $header);
++
++	$n = $socket->read($header, 8);
++	return undef if !defined $n or $n != 8;
++
++	@{$h}{qw/ version type id clen plen /} = unpack("CCnnC", $header);
++
++	$n = $socket->read($h->{content}, $h->{clen});
++	return undef if $n != $h->{clen};
++
++	$n = $socket->read($h->{padding}, $h->{plen});
++	return undef if $n != $h->{plen};
++
++	$h->{socket} = $socket;
++	return $h;
++}
++
++sub fastcgi_respond($$) {
++	my ($h, $body) = @_;
++
++	# stdout
++	$h->{socket}->write(pack("CCnnCx", $h->{version}, 6, $h->{id},
++		length($body), 0));
++	$h->{socket}->write($body);
++
++	# write some text to stdout and stderr splitted over multiple network
++	# packets to test if we correctly set pipe length in various places
++
++	my $tt = "test text, just for test";
++
++	$h->{socket}->write(pack("CCnnCx", $h->{version}, 6, $h->{id},
++		length($tt . $tt), 0) . $tt);
++	select(undef, undef, undef, 0.1);
++	$h->{socket}->write($tt . pack("CC", $h->{version}, 7));
++	select(undef, undef, undef, 0.1);
++	$h->{socket}->write(pack("nnCx", $h->{id}, length($tt), 0));
++	$h->{socket}->write($tt);
++
++	# close stdout
++	$h->{socket}->write(pack("CCnnCx", $h->{version}, 6, $h->{id}, 0, 0));
++
++	select(undef, undef, undef, 0.1);
++
++	# end request
++	$h->{socket}->write(pack("CCnnCx", $h->{version}, 3, $h->{id}, 8, 0));
++	$h->{socket}->write(pack("NCxxx", 0, 0));
++}
++
++sub fastcgi_test_daemon {
++	my $server = IO::Socket::INET->new(
++		Proto => 'tcp',
++		LocalAddr => '127.0.0.1:8081',
++		Listen => 5,
++		Reuse => 1
++	)
++		or die "Can't create listening socket: $!\n";
++
++	local $SIG{PIPE} = 'IGNORE';
++
++	my $ccount = 0;
++	my $rcount = 0;
++
++	while (my $client = $server->accept()) {
++		$client->autoflush(1);
++		Test::Nginx::log_core('||', "fastcgi connection");
++
++		$ccount++;
++
++		while (my $h = fastcgi_read_record($client)) {
++			Test::Nginx::log_core('||', "fastcgi record: "
++				. " $h->{version}, $h->{type}, $h->{id}, "
++				. "'$h->{content}'");
++
++			# skip everything unless stdin, then respond
++			next if $h->{type} != 5;
++
++			$rcount++;
++
++			# respond
++			fastcgi_respond($h, <<EOF);
++Location: http://localhost:8080/redirect
++Content-Type: text/html
++
++SEE-THIS
++request: $rcount
++connection: $ccount
++EOF
++		}
++
++		close $client;
++	}
++}
++
++###############################################################################
+diff --git a/modules/ngx_http_upstream_keepalive/t/memcached-keepalive.t b/modules/ngx_http_upstream_keepalive/t/memcached-keepalive.t
+new file mode 100644
+index 0000000..ef883b8
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/t/memcached-keepalive.t
+@@ -0,0 +1,208 @@
++#!/usr/bin/perl
++
++# (C) Maxim Dounin
++
++# Test for memcached with keepalive.
++
++###############################################################################
++
++use warnings;
++use strict;
++
++use Test::More;
++use Test::Nginx;
++
++###############################################################################
++
++select STDERR; $| = 1;
++select STDOUT; $| = 1;
++
++eval { require Cache::Memcached; };
++plan(skip_all => 'Cache::Memcached not installed') if $@;
++
++my $t = Test::Nginx->new()->has('rewrite')->has_daemon('memcached')->plan(17)
++	->write_file_expand('nginx.conf', <<'EOF');
++
++%%TEST_GLOBALS%%
++
++daemon         off;
++
++events {
++}
++
++http {
++    %%TEST_GLOBALS_HTTP%%
++
++    upstream memd {
++        server 127.0.0.1:8081;
++        keepalive 1;
++    }
++
++    upstream memd2 {
++        server 127.0.0.1:8081;
++        server 127.0.0.1:8082;
++        keepalive 1 single;
++    }
++
++    upstream memd3 {
++        server 127.0.0.1:8081;
++        server 127.0.0.1:8082;
++        keepalive 1;
++    }
++
++    upstream memd4 {
++        server 127.0.0.1:8081;
++        server 127.0.0.1:8082;
++        keepalive 10;
++    }
++
++    server {
++        listen       127.0.0.1:8080;
++        server_name  localhost;
++
++        location / {
++            set $memcached_key $uri;
++            memcached_pass memd;
++        }
++
++        location /next {
++            set $memcached_key $uri;
++            memcached_next_upstream  not_found;
++            memcached_pass memd;
++        }
++
++        location /memd2 {
++            set $memcached_key "/";
++            memcached_pass memd2;
++        }
++
++        location /memd3 {
++            set $memcached_key "/";
++            memcached_pass memd3;
++        }
++
++        location /memd4 {
++            set $memcached_key "/";
++            memcached_pass memd4;
++        }
++    }
++}
++
++EOF
++
++my $memhelp = `memcached -h`;
++my @memopts1 = ();
++my @memopts2 = ();
++
++if ($memhelp =~ /repcached/) {
++	# repcached patches adds additional listen socket memcached
++	# that should be different too
++
++	push @memopts1, '-X', '8091';
++	push @memopts2, '-X', '8092';
++}
++if ($memhelp =~ /-U/) {
++	# UDP ports no longer off by default in memcached 1.2.7+
++
++	push @memopts1, '-U', '0';
++	push @memopts2, '-U', '0';
++}
++
++$t->run_daemon('memcached', '-l', '127.0.0.1', '-p', '8081', @memopts1);
++$t->run_daemon('memcached', '-l', '127.0.0.1', '-p', '8082', @memopts2);
++
++$t->run();
++
++$t->waitforsocket('127.0.0.1:8081')
++	or die "Unable to start memcached";
++$t->waitforsocket('127.0.0.1:8082')
++	or die "Unable to start second memcached";
++
++###############################################################################
++
++my $memd1 = Cache::Memcached->new(servers => [ '127.0.0.1:8081' ]);
++my $memd2 = Cache::Memcached->new(servers => [ '127.0.0.1:8082' ]);
++
++$memd1->set('/', 'SEE-THIS');
++$memd2->set('/', 'SEE-THIS');
++$memd1->set('/big', 'X' x 1000000);
++
++my $total = $memd1->stats()->{total}->{total_connections};
++
++like(http_get('/'), qr/SEE-THIS/, 'keepalive memcached request');
++like(http_get('/notfound'), qr/404/, 'keepalive memcached not found');
++like(http_get('/next'), qr/404/,
++	'keepalive not found with memcached_next_upstream');
++like(http_get('/'), qr/SEE-THIS/, 'keepalive memcached request again');
++like(http_get('/'), qr/SEE-THIS/, 'keepalive memcached request again');
++like(http_get('/'), qr/SEE-THIS/, 'keepalive memcached request again');
++
++is($memd1->stats()->{total}->{total_connections}, $total + 1,
++	'only one connection used');
++
++# Since nginx doesn't read all data from connection in some situations (head
++# requests, post_action, errors writing to client) we have to close such
++# connections.  Check if we really do close them.
++
++$total = $memd1->stats()->{total}->{total_connections};
++
++unlike(http_head('/'), qr/SEE-THIS/, 'head request');
++like(http_get('/'), qr/SEE-THIS/, 'get after head');
++
++is($memd1->stats()->{total}->{total_connections}, $total + 1,
++	'head request closes connection');
++
++$total = $memd1->stats()->{total}->{total_connections};
++
++unlike(http_head('/big'), qr/XXX/, 'big head');
++like(http_get('/'), qr/SEE-THIS/, 'get after big head');
++
++is($memd1->stats()->{total}->{total_connections}, $total + 1,
++	'big head request closes connection');
++
++# two backends with 'single' option - should establish only one connection
++
++$total = $memd1->stats()->{total}->{total_connections} +
++	$memd2->stats()->{total}->{total_connections};
++
++http_get('/memd2');
++http_get('/memd2');
++http_get('/memd2');
++
++is($memd1->stats()->{total}->{total_connections} +
++	$memd2->stats()->{total}->{total_connections}, $total + 1,
++	'only one connection with two backends and single');
++
++$total = $memd1->stats()->{total}->{total_connections} +
++	$memd2->stats()->{total}->{total_connections};
++
++# two backends without 'single' option and maximum number of cached
++# connections set to 1 - should establish new connection on each request
++
++http_get('/memd3');
++http_get('/memd3');
++http_get('/memd3');
++
++is($memd1->stats()->{total}->{total_connections} +
++	$memd2->stats()->{total}->{total_connections}, $total + 3,
++	'3 connections should be established');
++
++# two backends without 'single' option and maximum number of cached
++# connections set to 10 - should establish only two connections (1 per backend)
++
++$total = $memd1->stats()->{total}->{total_connections} +
++        $memd2->stats()->{total}->{total_connections};
++
++http_get('/memd4');
++http_get('/memd4');
++http_get('/memd4');
++
++is($memd1->stats()->{total}->{total_connections} +
++	$memd2->stats()->{total}->{total_connections}, $total + 2,
++	'connection per backend');
++
++$t->stop();
++
++like(`grep -F '[alert]' ${\($t->testdir())}/error.log`, qr/^$/s, 'no alerts');
++
++###############################################################################
+diff --git a/modules/ngx_http_upstream_keepalive/t/proxy.t b/modules/ngx_http_upstream_keepalive/t/proxy.t
+new file mode 100644
+index 0000000..c2a0205
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/t/proxy.t
+@@ -0,0 +1,358 @@
++#!/usr/bin/perl
++
++# (C) Maxim Dounin
++
++# Tests for proxy with keepalive.
++
++###############################################################################
++
++use warnings;
++use strict;
++
++use Test::More;
++use IO::Socket::INET;
++use Socket qw/ CRLF /;
++
++use Test::Nginx;
++
++###############################################################################
++
++select STDERR; $| = 1;
++select STDOUT; $| = 1;
++
++my $t = Test::Nginx->new()->has(qw/http proxy ssi rewrite/)
++	->write_file_expand('nginx.conf', <<'EOF');
++
++%%TEST_GLOBALS%%
++
++daemon off;
++
++events {
++}
++
++http {
++    %%TEST_GLOBALS_HTTP%%
++
++    upstream backend {
++        server 127.0.0.1:8081;
++        keepalive 1;
++    }
++
++    server {
++        listen       127.0.0.1:8080;
++        server_name  localhost;
++
++        proxy_read_timeout 2s;
++        proxy_http_version 1.1;
++        proxy_set_header Connection "";
++
++        location / {
++            proxy_pass http://backend;
++        }
++
++        location /unbuffered/ {
++            proxy_pass http://backend;
++            proxy_buffering off;
++        }
++
++        location /inmemory/ {
++            ssi on;
++            rewrite ^ /ssi.html break;
++        }
++    }
++}
++
++EOF
++
++$t->write_file('ssi.html',
++	'<!--#include virtual="/include$request_uri" set="x" -->' .
++	'set: <!--#echo var="x" -->');
++
++$t->run_daemon(\&http_daemon);
++
++eval {
++	open OLDERR, ">&", \*STDERR; close STDERR;
++	$t->run();
++	open STDERR, ">&", \*OLDERR;
++};
++plan(skip_all => 'no keepalive patches') if $@;
++
++$t->plan(50);
++
++###############################################################################
++
++# There are 3 mostly independend modes of upstream operation:
++#
++# 1. Buffered, i.e. normal mode with "proxy_buffering on;"
++# 2. Unbuffered, i.e. "proxy_buffering off;".
++# 3. In memory, i.e. ssi <!--#include ... set -->
++#
++# These all should be tested.
++
++my ($r, $n);
++
++# buffered
++
++like($r = http_get('/buffered/length1'), qr/SEE-THIS/, 'buffered');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/length2'), qr/X-Connection: $n.*SEE/ms, 'buffered 2');
++
++like($r = http_get('/buffered/chunked1'), qr/SEE-THIS/, 'buffered chunked');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/chunked2'), qr/X-Connection: $n/,
++	'buffered chunked 2');
++
++like($r = http_get('/buffered/complex1'), qr/(0123456789){100}/,
++	'buffered complex chunked');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/complex2'), qr/X-Connection: $n/,
++	'buffered complex chunked 2');
++
++like($r = http_get('/buffered/chunk01'), qr/200 OK/, 'buffered 0 chunk');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/chunk02'), qr/X-Connection: $n/, 'buffered 0 chunk 2');
++
++like($r = http_head('/buffered/length/head1'), qr/(?!SEE-THIS)/,
++	'buffered head');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_head('/buffered/length/head2'), qr/X-Connection: $n/,
++	'buffered head 2');
++
++like($r = http_get('/buffered/empty1'), qr/200 OK/, 'buffered empty');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/empty2'), qr/X-Connection: $n/, 'buffered empty 2');
++
++like($r = http_get('/buffered/304nolen1'), qr/304 Not/, 'buffered 304');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/304nolen2'), qr/X-Connection: $n/, 'buffered 304 2');
++
++like($r = http_get('/buffered/304len1'), qr/304 Not/,
++	'buffered 304 with length');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/buffered/304len2'), qr/X-Connection: $n/,
++	'buffered 304 with length 2');
++
++# unbuffered
++
++like($r = http_get('/unbuffered/length1'), qr/SEE-THIS/, 'unbuffered');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/length2'), qr/X-Connection: $n/, 'unbuffered 2');
++
++like($r = http_get('/unbuffered/chunked1'), qr/SEE-THIS/, 'unbuffered chunked');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/chunked2'), qr/X-Connection: $n/,
++	'unbuffered chunked 2');
++
++like($r = http_get('/unbuffered/complex1'), qr/(0123456789){100}/,
++	'unbuffered complex chunked');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/complex2'), qr/X-Connection: $n/,
++	'unbuffered complex chunked 2');
++
++like($r = http_get('/unbuffered/chunk01'), qr/200 OK/, 'unbuffered 0 chunk');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/chunk02'), qr/X-Connection: $n/,
++	'unbuffered 0 chunk 2');
++
++like($r = http_get('/unbuffered/empty1'), qr/200 OK/, 'unbuffered empty');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/empty2'), qr/X-Connection: $n/,
++	'unbuffered empty 2');
++
++like($r = http_head('/unbuffered/length/head1'), qr/(?!SEE-THIS)/,
++	'unbuffered head');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_head('/unbuffered/length/head2'), qr/X-Connection: $n/,
++	'unbuffered head 2');
++
++like($r = http_get('/unbuffered/304nolen1'), qr/304 Not/, 'unbuffered 304');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/304nolen2'), qr/X-Connection: $n/,
++	'unbuffered 304 2');
++
++like($r = http_get('/unbuffered/304len1'), qr/304 Not/,
++	'unbuffered 304 with length');
++$r =~ m/X-Connection: (\d+)/; $n = $1;
++like(http_get('/unbuffered/304len2'), qr/X-Connection: $n/,
++	'unbuffered 304 with length 2');
++
++# in memory
++
++like($r = http_get('/inmemory/length1'), qr/SEE-THIS/, 'inmemory');
++$r =~ m/SEE-THIS(\d+)/; $n = $1;
++like(http_get('/inmemory/length2'), qr/SEE-THIS$n/, 'inmemory 2');
++
++like($r = http_get('/inmemory/empty1'), qr/200 OK/, 'inmemory empty');
++$r =~ m/SEE-THIS(\d+)/; $n = $1;
++like(http_get('/inmemory/empty2'), qr/200 OK/, 'inmemory empty 2');
++
++like($r = http_get('/inmemory/chunked1'), qr/SEE-THIS/, 'inmemory chunked');
++$r =~ m/SEE-THIS(\d+)/; $n = $1;
++like(http_get('/inmemory/chunked2'), qr/SEE-THIS$n/, 'inmemory chunked 2');
++
++like($r = http_get('/inmemory/complex1'), qr/(0123456789){100}/,
++	'inmemory complex chunked');
++$r =~ m/SEE-THIS(\d+)/; $n = $1;
++like(http_get('/inmemory/complex2'), qr/SEE-THIS$n/,
++	'inmemory complex chunked 2');
++
++like(http_get('/inmemory/chunk01'), qr/set: $/, 'inmemory 0 chunk');
++like(http_get('/inmemory/chunk02'), qr/set: $/, 'inmemory 0 chunk 2');
++
++# closed connection tests
++
++like(http_get('/buffered/closed1'), qr/200 OK/, 'buffered closed 1');
++like(http_get('/buffered/closed2'), qr/200 OK/, 'buffered closed 2');
++like(http_get('/unbuffered/closed1'), qr/200 OK/, 'unbuffered closed 1');
++like(http_get('/unbuffered/closed2'), qr/200 OK/, 'unbuffered closed 2');
++like(http_get('/inmemory/closed1'), qr/200 OK/, 'inmemory closed 1');
++like(http_get('/inmemory/closed2'), qr/200 OK/, 'inmemory closed 2');
++
++# check for errors, shouldn't be any
++
++like(`grep -F '[alert]' ${\($t->testdir())}/error.log`, qr/^$/s, 'no alerts');
++like(`grep -F '[error]' ${\($t->testdir())}/error.log`, qr/^$/s, 'no errors');
++
++###############################################################################
++
++sub http_daemon {
++	my $server = IO::Socket::INET->new(
++        	Proto => 'tcp',
++		LocalHost => '127.0.0.1:8081',
++        	Listen => 5,
++        	Reuse => 1
++	)
++        	or die "Can't create listening socket: $!\n";
++
++	my $ccount = 0;
++        my $rcount = 0;
++
++	# dumb server which is able to keep connections alive
++
++	while (my $client = $server->accept()) {
++		Test::Nginx::log_core('||', "connection from " . $client->peerhost());
++        	$client->autoflush(1);
++		$ccount++;
++
++		while (1) {
++			my $headers = '';
++			my $uri = '';
++
++        		while (<$client>) {
++				Test::Nginx::log_core('||', $_);
++				$headers .= $_;
++                		last if (/^\x0d?\x0a?$/);
++        		}
++
++			last if $headers eq '';
++			$rcount++;
++
++			$uri = $1 if $headers =~ /^\S+\s+([^ ]+)\s+HTTP/i;
++
++			if ($uri =~ m/length/) {
++				print $client
++					"HTTP/1.1 200 OK" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Content-Length: 26" . CRLF . CRLF;
++				print $client "TEST-OK-IF-YOU-SEE-THIS" .
++					sprintf("%03d", $ccount)
++					unless $headers =~ /^HEAD/i;
++
++                        } elsif ($uri =~ m/empty/) {
++				print $client
++					"HTTP/1.1 200 OK" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Content-Length: 0" . CRLF . CRLF;
++
++                        } elsif ($uri =~ m/304nolen/) {
++				print $client
++					"HTTP/1.1 304 Not Modified" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF . CRLF;
++
++                        } elsif ($uri =~ m/304len/) {
++				print $client
++					"HTTP/1.1 304 Not Modified" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Content-Length: 100" . CRLF . CRLF;
++
++			} elsif ($uri =~ m/chunked/) {
++				print $client
++					"HTTP/1.1 200 OK" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Transfer-Encoding: chunked" . CRLF .
++					CRLF;
++				print $client
++					"1a" . CRLF .
++					"TEST-OK-IF-YOU-SEE-THIS" .
++					sprintf("%03d", $ccount) . CRLF .
++					"0" . CRLF . CRLF
++					unless $headers =~ /^HEAD/i;
++
++			} elsif ($uri =~ m/complex/) {
++				print $client
++					"HTTP/1.1 200 OK" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Transfer-Encoding: chunked" . CRLF .
++					CRLF;
++
++				if ($headers !~ /^HEAD/i) {
++					for my $n (1..100) {
++						print $client
++							"a" . CRLF .
++							"0123456789" . CRLF;
++						select undef, undef, undef, 0.01
++							if $n % 50 == 0;
++					}
++					print $client
++						"1a" . CRLF .
++						"TEST-OK-IF-YOU-SEE-THIS" .
++						sprintf("%03d", $ccount) .
++						CRLF .
++						"0" . CRLF;
++					select undef, undef, undef, 0.05;
++					print $client CRLF;
++				}
++
++                        } elsif ($uri =~ m/chunk0/) {
++				print $client
++					"HTTP/1.1 200 OK" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Transfer-Encoding: chunked" . CRLF .
++					CRLF;
++				print $client
++					"0" . CRLF . CRLF
++					unless $headers =~ /^HEAD/i;
++
++			} elsif ($uri =~ m/closed/) {
++				print $client
++					"HTTP/1.1 200 OK" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Connection: close" . CRLF .
++					"Content-Length: 12" . CRLF . CRLF .
++					"0123456789" . CRLF;
++				last;
++
++			} else {
++        			print $client
++					"HTTP/1.1 404 Not Found" . CRLF .
++					"X-Request: $rcount" . CRLF .
++					"X-Connection: $ccount" . CRLF .
++					"Connection: close" . CRLF . CRLF .
++					"Oops, '$uri' not found" . CRLF;
++				last;
++			}
++		}
++
++        	close $client;
++	}
++}
++
++###############################################################################
+diff --git a/modules/ngx_http_upstream_keepalive/t/stale.t b/modules/ngx_http_upstream_keepalive/t/stale.t
+new file mode 100644
+index 0000000..cbaa7f7
+--- /dev/null
++++ b/modules/ngx_http_upstream_keepalive/t/stale.t
+@@ -0,0 +1,114 @@
++#!/usr/bin/perl
++
++# (C) Maxim Dounin
++
++# Test for stale events handling in upstream keepalive.
++
++###############################################################################
++
++use warnings;
++use strict;
++
++use Test::More;
++use Test::Nginx;
++
++###############################################################################
++
++select STDERR; $| = 1;
++select STDOUT; $| = 1;
++
++eval { require Cache::Memcached; };
++plan(skip_all => 'Cache::Memcached not installed') if $@;
++
++my $t = Test::Nginx->new()->has('rewrite')->has_daemon('memcached')->plan(2)
++	->write_file_expand('nginx.conf', <<'EOF');
++
++%%TEST_GLOBALS%%
++
++daemon         off;
++
++worker_processes 2;
++
++events {
++}
++
++http {
++    %%TEST_GLOBALS_HTTP%%
++
++    upstream memd {
++        server 127.0.0.1:8081;
++        keepalive 1;
++    }
++
++    server {
++        listen       127.0.0.1:8080 sndbuf=32k;
++        server_name  localhost;
++
++        location / {
++            set $memcached_key $uri;
++            memcached_pass memd;
++        }
++    }
++}
++
++EOF
++
++my $memhelp = `memcached -h`;
++my @memopts1 = ();
++
++if ($memhelp =~ /repcached/) {
++	# repcached patches adds additional listen socket memcached
++	# that should be different too
++
++	push @memopts1, '-X', '8091';
++}
++if ($memhelp =~ /-U/) {
++	# UDP ports no longer off by default in memcached 1.2.7+
++
++	push @memopts1, '-U', '0';
++}
++
++$t->run_daemon('memcached', '-l', '127.0.0.1', '-p', '8081', @memopts1);
++
++$t->run();
++
++$t->waitforsocket('127.0.0.1:8081')
++	or die "Unable to start memcached";
++
++###############################################################################
++
++my $memd1 = Cache::Memcached->new(servers => [ '127.0.0.1:8081' ]);
++
++# It's possible that stale events occur, i.e. read event handler called
++# for just saved upstream connection without any data available for
++# read.  We shouldn't close upstream connection in such situation.
++#
++# This happens due to reading from upstream connection on downstream write
++# events.  More likely to happen with multiple workers due to use of posted
++# events.
++#
++# Stale event may only happen if reading response from upstream requires
++# entering event loop, i.e. response should be big enough.  On the other
++# hand, it is less likely to occur with full client's connection output
++# buffer.
++#
++# We use here 2 workers, 20k response and set output buffer on clients
++# connection to 32k.  This allows more or less reliably reproduce stale
++# events at least on FreeBSD testbed here.
++
++$memd1->set('/big', 'X' x 20480);
++
++my $total = $memd1->stats()->{total}->{total_connections};
++
++for (1 .. 100) {
++	http_get('/big');
++}
++
++cmp_ok($memd1->stats()->{total}->{total_connections}, '<=', $total + 2,
++	'only one connection per worker used');
++
++$t->stop();
++
++like(`grep -F '[alert]' ${\($t->testdir())}/error.log`, qr/^$/s, 'no alerts');
++
++###############################################################################
